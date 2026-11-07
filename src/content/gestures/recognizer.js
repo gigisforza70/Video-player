@@ -24,6 +24,11 @@ const MOVE_TOLERANCE_PX = 12;
 // little, and that drift must never be read as a request the band did not
 // make.
 const VERTICAL_BIAS = 1.5;
+// The right-side vertical gesture can raise the media gain up to 3x. The
+// browser's media volume remains capped at 1; gain above that is only applied
+// through Web Audio to same-origin media, where routing cannot taint playback.
+const MAX_VOLUME_GAIN = 3;
+const VOLUME_GESTURE_GAIN_PER_SCREEN = 3;
 
 const isVerticalMove = (dx, dy) => Math.abs(dy) > Math.abs(dx) * VERTICAL_BIAS;
 
@@ -34,6 +39,7 @@ const MODE = {
   HOLD: 'hold',
   PINCH: 'pinch',
   DISMISS: 'dismiss',
+  VOLUME: 'volume',
   ABANDONED: 'abandoned',
 };
 
@@ -51,12 +57,14 @@ export const createRecognizer = (surface, handlers) => {
   let tapCount = 0;
   let tapZone = ZONE.MIDDLE;
   let dismissAnchor = null;
-  // The most recent sample of a drag that is being tracked, so its end can
-  // report the pace of the last stretch — a flick reads as intent even where
-  // it has not travelled far.
+  let volumeAnchor = null;
   let lastDismissSample = null;
   let pinchStartDistance = 0;
   let isEnabled = true;
+  let audioContext = null;
+  let mediaSource = null;
+  let gainNode = null;
+  let effectiveVolume = null;
 
   const emit = (name, detail) => {
     const handler = handlers[name];
@@ -89,25 +97,129 @@ export const createRecognizer = (surface, handlers) => {
     emit('holdStart', { zone: anchor.zone });
   });
 
-  // The tap window's moment, spoken two ways: the fast rhythm a fresh tap
-  // opens, and the slower one a live side run keeps. The slot is told which
-  // by whoever arms it — each `set` simply carries its duration.
   const tapTimer = createTimerSlot(flushTaps);
   function flushTaps() {
-    // Everything a tap had to say was said where it happened; the window
-    // was only ever about whether more taps were still on their way.
     tapCount = 0;
   }
 
+  const volumeToastTimer = createTimerSlot(() => {
+    const root = surface.getRootNode();
+    root.querySelector?.('.toast')?.classList.remove('is-visible');
+  });
+
+  const videoElement = () => {
+    const root = surface.getRootNode();
+    // The overlay is in the player's shadow root; its host and the video are
+    // siblings in the player frame. Keep the recognizer harmless in isolation
+    // (including its unit tests) when there is no player host.
+    return root.host?.parentElement?.querySelector('video') ?? null;
+  };
+
+  const canSafelyBoost = (video) => {
+    if (!video.currentSrc) return false;
+    try {
+      return new URL(video.currentSrc, document.baseURI).origin === location.origin;
+    } catch {
+      return false;
+    }
+  };
+
+  const ensureGainGraph = (video) => {
+    if (gainNode) return true;
+    if (!canSafelyBoost(video)) return false;
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return false;
+    try {
+      audioContext = new AudioContextClass();
+      mediaSource = audioContext.createMediaElementSource(video);
+      gainNode = audioContext.createGain();
+      mediaSource.connect(gainNode);
+      gainNode.connect(audioContext.destination);
+      video.volume = 1;
+      audioContext.resume().catch(() => {});
+      return true;
+    } catch {
+      // If graph setup failed after creating the source node, reconnect it
+      // directly so the attempt cannot leave the video silent.
+      try {
+        mediaSource?.disconnect();
+        mediaSource?.connect(audioContext.destination);
+      } catch {
+        // There is no safe graph to use; retain the media element's native
+        // volume rather than claiming that a boost was applied.
+      }
+      gainNode?.disconnect();
+      audioContext?.close().catch(() => {});
+      audioContext = null;
+      mediaSource = null;
+      gainNode = null;
+      return false;
+    }
+  };
+
+  const readVolume = (video) => {
+    if (effectiveVolume !== null) return effectiveVolume;
+    return Number.isFinite(video.volume) ? video.volume : 1;
+  };
+
+  const setVolume = (video, requested) => {
+    const level = Math.max(0, Math.min(MAX_VOLUME_GAIN, requested));
+    if (level <= 1) {
+      try {
+        if (gainNode) gainNode.gain.value = 1;
+        video.volume = level;
+        effectiveVolume = video.volume;
+      } catch {
+        effectiveVolume = readVolume(video);
+      }
+      return effectiveVolume;
+    }
+    if (!ensureGainGraph(video)) {
+      // Cross-origin media is deliberately not routed through Web Audio:
+      // doing so without CORS approval can mute it. It remains at the
+      // browser's native maximum instead.
+      video.volume = 1;
+      effectiveVolume = 1;
+      return effectiveVolume;
+    }
+    gainNode.gain.value = level;
+    video.volume = 1;
+    effectiveVolume = level;
+    return level;
+  };
+
+  const showVolume = (level) => {
+    const root = surface.getRootNode();
+    const toast = root.querySelector?.('.toast');
+    if (!toast) return;
+    const percent = Math.round(level * 100);
+    toast.textContent = `Volume ${percent}%`;
+    toast.classList.add('is-visible');
+    volumeToastTimer.set(900);
+  };
+
+  const releaseAudioGraph = () => {
+    if (mediaSource && audioContext) {
+      try {
+        mediaSource.disconnect();
+        // A MediaElementAudioSourceNode owns the element's output once made.
+        // Route it straight to the speakers before releasing our context.
+        mediaSource.connect(audioContext.destination);
+      } catch {
+        // The session's normal media-state restoration remains the fallback.
+      }
+    }
+    gainNode?.disconnect();
+    audioContext?.close().catch(() => {});
+    audioContext = null;
+    mediaSource = null;
+    gainNode = null;
+    effectiveVolume = null;
+  };
+
   // Every tap speaks the moment the finger lifts: the controls come up under
   // it sooner than any window can allow, and a run of side seeks is paid per
-  // tap rather than held to a rhythm the finger did not keep. The first tap
-  // acts; every tap that follows while a side run lives joins it — with a
-  // stray that lands on the neutral middle counted into the run it came
-  // from, because a second tap rarely lands exactly where the first did. A
-  // tap on the other side, or one that arrives once the run is done, starts
-  // a run of its own; the neutral middle never formed runs, and still does
-  // not.
+  // tap rather than held to a rhythm the finger did not keep.
   const registerTap = (zone, point) => {
     if (
       tapCount > 0 &&
@@ -121,26 +233,11 @@ export const createRecognizer = (surface, handlers) => {
         x: point.x,
         y: point.y,
       });
-      // Between taps of a live run the window is the run's own, a slower
-      // rhythm than the double-tap that started it: tapping on to go further
-      // is a habit, not a reflex. Rearming is replacement, so the run's
-      // window slides forward with every tap that joins.
       tapTimer.set(SEEK_RUN_MS);
       return;
     }
-    // A fresh tap, whatever the last run left behind: the run's timer is
-    // cancelled rather than waited out, so a tap that lands just past a run
-    // is judged on its own merits — and arming the fresh window replaces
-    // what was pending, which is that cancellation said another way.
     tapCount = 1;
     tapZone = zone;
-    // Zones are named from the press, but the coordinates that travel are
-    // the finger's own resting place — its last tracked sample, read when
-    // the tap completed. A press that wanders within the tolerance is still
-    // the tap it was; that much drift is not a new gesture. Where the tap
-    // is aimed is where the finger settled, though: the jump onto the bar
-    // plays the moment under the lifted finger, the place the eye was
-    // watching when the tap was done.
     emit('tap', {
       zone,
       x: point.x,
@@ -148,8 +245,6 @@ export const createRecognizer = (surface, handlers) => {
       clientX: point.clientX,
       clientY: point.clientY,
     });
-    // The window after a first tap exists only to know whether a second is
-    // coming; nothing is decided when it runs out.
     tapTimer.set(MULTI_TAP_WINDOW_MS);
   };
 
@@ -157,8 +252,6 @@ export const createRecognizer = (surface, handlers) => {
     holdTimer.clear();
     if (mode === MODE.DRAG) emit('dragEnd', { zone: anchor.zone });
     if (mode === MODE.HOLD) emit('holdEnd', { zone: anchor.zone });
-    // A second finger arrives while a pull to dismiss is under way: the
-    // pull is given up rather than judged, and the pinch takes the stage.
     if (mode === MODE.DISMISS) {
       emit('dismissEnd', { progress: 0, velocity: 0 });
       dismissAnchor = null;
@@ -220,43 +313,46 @@ export const createRecognizer = (surface, handlers) => {
       const dy = point.y - anchor.y;
       if (Math.hypot(dx, dy) < MOVE_TOLERANCE_PX) return;
       holdTimer.clear();
-      // Checked before anything else: a vertical pull is the same gesture
-      // wherever on the picture it starts, middle and sides alike.
       if (isVerticalMove(dx, dy)) {
-        if (dy < 0) {
-          // An upward drag has no business of its own — feed pages are out
-          // of the player's scope — so the gesture is abandoned and the
-          // lift stays a dead lift.
+        if (anchor.zone === ZONE.RIGHT) {
+          mode = MODE.VOLUME;
+          const video = videoElement();
+          if (video) {
+            volumeAnchor = {
+              y: anchor.y,
+              height: point.height,
+              level: readVolume(video),
+              video,
+            };
+          }
+        } else if (dy < 0) {
           mode = MODE.ABANDONED;
           return;
+        } else {
+          mode = MODE.DISMISS;
+          dismissAnchor = anchor;
+          lastDismissSample = { y: point.y, time: performance.now() };
+          emit('dismissStart', {});
+          return;
         }
-        // Finger down means out. The drag is a pull to dismiss, read as a
-        // pull-to-close from wherever it starts — middle and sides alike.
-        // The pull goes on being tracked, move by move; what the pull turns
-        // out to be is the player's to read, from how far it went and how
-        // fast it lifted.
-        mode = MODE.DISMISS;
-        dismissAnchor = anchor;
-        lastDismissSample = { y: point.y, time: performance.now() };
-        emit('dismissStart', {});
-        return;
+      } else {
+        if (Math.hypot(dx, dy) < SCRUB_ENGAGE_PX) return;
+        mode = MODE.DRAG;
+        emit('dragStart', { zone: anchor.zone, x: anchor.x, y: anchor.y });
       }
-      // Whatever arrives here is a scrub: horizontal from anywhere on the
-      // picture, or vertical where the band resumed it. Engagement waits a
-      // second boundary, and the same one for every zone. A grab is decided
-      // twice over — past the move tolerance, then past this line — because
-      // the first twelve pixels the finger travels may be a tap's own
-      // wander, and the bar's whole-width sweep would pay for it in film.
-      // Below the line the gesture stays pending, so a lift is registered
-      // as the tap it was, wherever the drag started.
-      if (Math.hypot(dx, dy) < SCRUB_ENGAGE_PX) return;
-      mode = MODE.DRAG;
-      emit('dragStart', { zone: anchor.zone, x: anchor.x, y: anchor.y });
+    }
+
+    if (mode === MODE.VOLUME) {
+      if (volumeAnchor) {
+        const change = ((volumeAnchor.y - point.y) / volumeAnchor.height) *
+          VOLUME_GESTURE_GAIN_PER_SCREEN;
+        const level = setVolume(volumeAnchor.video, volumeAnchor.level + change);
+        showVolume(level);
+      }
+      return;
     }
 
     if (mode === MODE.DISMISS) {
-      // Every move is reported as a share of the stage's height, up to and
-      // past the edge: the finger decides how far the pull reaches.
       emit('dismissMove', {
         progress: (point.y - dismissAnchor.y) / point.height,
       });
@@ -278,10 +374,6 @@ export const createRecognizer = (surface, handlers) => {
     anchor.lastY = point.y;
   };
 
-  // The pull is reported on two counts: how far it went, and how fast it
-  // lifted. The pace comes from the last measured stretch of the drag —
-  // the same report whether the finger ran a long way slowly or a short
-  // way quickly — and what the counts amount to is the player's verdict.
   const finishDismiss = (event) => {
     const point = localPoint(event);
     const progress = (point.y - dismissAnchor.y) / point.height;
@@ -290,8 +382,6 @@ export const createRecognizer = (surface, handlers) => {
       const slice =
         (point.y - lastDismissSample.y) /
         Math.max(1, performance.now() - lastDismissSample.time);
-      // A slice stood still, or ran back up, says nothing fast in favour of
-      // going; the travel alone has to carry such a pull.
       velocity = slice > 0 ? (slice * 1000) / point.height : 0;
     }
     emit('dismissEnd', { progress, velocity });
@@ -301,9 +391,6 @@ export const createRecognizer = (surface, handlers) => {
 
   const handleUp = (event) => {
     if (!pointers.has(event.pointerId)) return;
-    // The finger's last tracked sample is read before the pointer is
-    // forgotten: the settled place is what a tap is judged from, and the
-    // down event's own coordinates are only its first guess at it.
     const settled = pointers.get(event.pointerId);
     pointers.delete(event.pointerId);
 
@@ -321,6 +408,7 @@ export const createRecognizer = (surface, handlers) => {
     else if (mode === MODE.DISMISS) finishDismiss(event);
     else if (mode === MODE.PENDING) registerTap(anchor.zone, settled);
     mode = MODE.IDLE;
+    volumeAnchor = null;
   };
 
   const handleCancel = (event) => {
@@ -329,20 +417,18 @@ export const createRecognizer = (surface, handlers) => {
     holdTimer.clear();
     if (mode === MODE.DRAG) emit('dragEnd', { zone: anchor.zone });
     if (mode === MODE.HOLD) emit('holdEnd', { zone: anchor.zone });
-    // A pull that the system took the finger away from is returned, not
-    // judged: whatever interrupted could not have been the finger's intent,
-    // so the player comes back where it was.
     if (mode === MODE.DISMISS) {
       emit('dismissEnd', { progress: 0, velocity: 0 });
       dismissAnchor = null;
       lastDismissSample = null;
     }
     if (mode === MODE.PINCH && pointers.size < 2) emit('pinchEnd', {});
-    if (pointers.size === 0) mode = MODE.IDLE;
+    if (pointers.size === 0) {
+      mode = MODE.IDLE;
+      volumeAnchor = null;
+    }
   };
 
-  // Without this, a long press raises the system context menu and Gecko
-  // cancels the pointer, which used to drop hold-to-2x after a second or two.
   const blockContextMenu = (event) => event.preventDefault();
 
   surface.addEventListener('contextmenu', blockContextMenu);
@@ -358,6 +444,8 @@ export const createRecognizer = (surface, handlers) => {
     destroy: () => {
       holdTimer.clear();
       tapTimer.clear();
+      volumeToastTimer.clear();
+      releaseAudioGraph();
       surface.removeEventListener('contextmenu', blockContextMenu);
       surface.removeEventListener('pointerdown', handleDown);
       surface.removeEventListener('pointermove', handleMove);
